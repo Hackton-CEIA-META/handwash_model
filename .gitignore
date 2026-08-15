@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Ambiente
+.venv/
+venv/
+env/
+
+# Dados - bronze/silver/gold: manifests (CSV/JSON) sao pequenos e versionados;
+# os artefatos grandes/derivados (landmarks por video, janelas de treino) NAO sao.
+data/silver/landmarks/
+data/gold/*.npz
+data/gold/*.npy
+
+# Modelos - checkpoints de treino sao intermediarios, nao versionados.
+# O artefato final (.tflite + classes.json + MODEL_CARD.md) em models/artifacts/ FICA versionado.
+models/checkpoints/
+*.h5
+
+# Bundle do MediaPipe (binario baixado, nao gerado por nos)
+models/mediapipe/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# segredos
+.env
+*.token
+
+# Documentos locais de planejamento/execucao (internos, nao versionados)
+# README.md e CLAUDE.md ficam versionados (visibilidade do time + decisoes fixas de arquitetura)
+DIA1_HANDOFF.md
+Plano de Dados e Modelo.md
