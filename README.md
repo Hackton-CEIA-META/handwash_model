@@ -14,12 +14,13 @@ Este repositório cobre a **trilha de dados + modelo** apenas. A trilha de Andro
 | Camada Bronze (manifest 300 vídeos) | ✅ Concluído | 300 vídeos indexados, 7 classes, split por sujeito auditado, 0 vazamentos |
 | Checagem de viabilidade (gate MediaPipe) | ✅ Concluído | 90,6% `at_least_one_hand_rate` geral · 11/12 pastas acima de 80% |
 | Camada Silver (extração de landmarks) | ✅ Concluído | 300/300 .npz · 0 falhas · 0 NaN/Inf · fps 30.04–30.23 |
-| Testes unitários (`domain/`) | ✅ Concluído | 24/24 passando |
-| **Camada Gold (janelas normalizadas)** | 🔲 Dia 2 | Próximo passo: `scripts/04_build_windows.py` |
-| Smoke test TFLite builtin-only | 🔲 Dia 2 | Antes do treino real (Conv1D+GRU dummy → conversão) |
-| Treino do classificador | 🔲 Dia 2 | Conv1D+GRU ~89K params · val/test por sujeito |
-| Exportação TFLite INT8 | 🔲 Dia 2 | float32 I/O · builtin-ops-only · comparação Keras vs TFLite |
-| Pacote de handoff Android | 🔲 Dia 2 | `.tflite` + `classes.json` + `MODEL_CARD.md` + IO de exemplo |
+| Camada Gold (janelas normalizadas) | ✅ Concluído | 5.319 janelas (treino 4.126 / val 552 / teste 641) · 0 vazamento de sujeito |
+| Smoke test TFLite builtin-only | ✅ Concluído | GRU dinâmico falha a conversão; `GRU(unroll=True)` converte e roda |
+| Treino do classificador | ✅ Concluído | Conv1D+GRU, 88.967 params · **97,19%** teste · **100%** por vídeo (voto majoritário) |
+| Exportação TFLite INT8 | ✅ Concluído | **96,10%** teste (queda de 1,09pp, dentro do gate de ~2pp) · normalização embutida no grafo |
+| Pacote de handoff Android | ✅ Concluído | `.tflite` + `classes.json` + `MODEL_CARD.md` + `parity_check.py` (testado) + `sample_io_pairs.npz` |
+| Testes unitários (`domain/`) | ✅ Concluído | 52/52 passando |
+| **Teste de domain gap (câmera egocêntrica)** | 🔲 Dia 3 | Gravar vídeo próprio, rodar pelo pipeline, medir queda de acurácia |
 
 ---
 
@@ -32,20 +33,28 @@ data/
   bronze/    manifest.csv          → 300 vídeos indexados (sujeito, classe, split, G-group)
   silver/    manifest.csv          → métricas de extração por vídeo
              landmarks/*.npz       → landmarks frame-a-frame (gitignored — derivado, ~grande)
-  gold/      (vazio — Dia 2)       → janelas (30 passos × 128 features), prontas p/ treino
+  gold/      manifest.csv          → 1 linha por janela (vídeo, split, classe, split_row_idx)
+             classes.json          → as 7 classes, ordem congelada
+             {train,val,test}/windows.npz  → arrays X (N,30,128) + y (N,), gitignored (derivado)
 ```
 
 ### Código — clean architecture
 
 ```
 src/handwash/
-  domain/          → lógica pura, sem I/O: parsing de nome, esquema de classes,
-                     split por sujeito, preenchimento de gaps, amostragem
-  infrastructure/  → adapters de I/O: OpenCV, MediaPipe Hand Landmarker
-  application/     → casos de uso (build_manifest, extract_landmarks, build_windows...)
-  config/          → constantes (CLASSES, SUBJECT_SPLITS, janela temporal) e caminhos
-scripts/           → wrappers finos de CLI (00–03 executados; 04–07 são Dia 2)
-tests/             → 24 testes unitários da camada domain
+  domain/          → lógica pura, sem I/O: parsing de nome, esquema de classes, split por
+                     sujeito, gaps, amostragem, reamostragem 15fps, janelamento, normalização
+                     por mão, augmentação (5 tipos), pesos de classe
+  infrastructure/  → adapters de I/O: OpenCV, MediaPipe Hand Landmarker, fábrica de modelos
+                     Keras, conversor TFLite, camada de normalização em ops de TF (export)
+  application/     → casos de uso (build_manifest, extract_landmarks, build_windows,
+                     check_tflite_viability, train_classifier, export_tflite,
+                     evaluate_tflite_vs_keras, build_handoff_package)
+  config/          → constantes (CLASSES, SUBJECT_SPLITS, janela temporal, contrato de
+                     features) e caminhos
+scripts/           → wrappers finos de CLI: 00–04 (Dia 1-2), smoke_test_tflite.py (gate,
+                     sem número), 05–08 (treino, export, comparação, handoff — Dia 2)
+tests/             → 52 testes unitários da camada domain
 ```
 
 ### Contrato de classes (7 classes, fixo — índice = posição no softmax)
@@ -100,51 +109,79 @@ python scripts/03_extract_landmarks.py  # camada silver: 300 .npz de landmarks (
 pytest tests/ -q                        # 24 testes domain passando
 ```
 
-### Dia 2 — próximos passos (em ordem)
+### Dia 2 — já executado
 
 ```bash
-python scripts/04_build_windows.py      # camada gold: janelas 2s/30 passos, norm. por mão
-python scripts/smoke_test_tflite.py     # PRIMEIRO: Conv1D+GRU dummy → conversão builtin-only
-python scripts/05_train_classifier.py   # treino: Conv1D+GRU ~89K params, class weights do manifest
-python scripts/06_export_tflite.py      # INT8 full-integer, float32 I/O, repr. dataset só do train
-python scripts/07_evaluate_tflite.py    # tabela Keras vs TFLite por classe + handoff artifacts
+python scripts/04_build_windows.py           # gold: 5.319 janelas, norm. por mão embutida
+python scripts/smoke_test_tflite.py          # gate: GRU(unroll=True) converte builtin-only
+python scripts/05_train_classifier.py        # treino: 97,19% teste, 100% por vídeo
+python scripts/06_export_tflite.py           # INT8 full-integer, normalização embutida no grafo
+python scripts/07_evaluate_tflite_vs_keras.py  # Keras vs TFLite: 96,10% teste (queda 1,09pp)
+python scripts/08_build_handoff_package.py   # monta models/artifacts/ (classes.json + sample IO)
+pytest tests/ -q                             # 52 testes domain passando
 ```
+
+Reconstruir do zero (04 → 08) leva ~1-2 minutos no total — os scripts são idempotentes.
+
+### Dia 3 — próximo passo
+
+Testar o domain gap câmera de pia (dataset de treino) → câmera egocêntrica (óculos, nunca testada):
+gravar um vídeo próprio, rodar pelo mesmo pipeline de extração/gold, avaliar contra o modelo treinado.
 
 ---
 
-## Modelo planejado
+## Modelo (confirmado, Dia 2)
 
-**Arquitetura primária (~89K params):**
+**Arquitetura primária — 88.967 parâmetros, a única testada, converteu e treinou de primeira:**
 ```
 Input (30 passos, 128 features)
   └─ Conv1D(64, k=5) → LayerNorm → Conv1D(64, k=5) → Dropout(0.3)
-  └─ GRU(64) → Dropout(0.4)
+  └─ GRU(64, unroll=True) → Dropout(0.4)
   └─ Dense(32) → Dropout(0.3) → Dense(7, softmax)
 ```
+`unroll=True` é obrigatório: a GRU dinâmica (`unroll=False`) falha a conversão TFLite builtin-only
+(`tf.TensorListReserve ... requires element_shape to be static`) — confirmado empiricamente.
 
-**Entrada por frame:** 2 mãos × 21 landmarks × 3 coords + 2 flags de presença = **128 features**  
-**Janela temporal:** 2,0s → 30 passos a 15fps (reamostrado por timestamp, não por índice)  
-**Normalização:** por mão, origem no pulso (landmark 0), escala pela dist. pulso→MCP (landmark 9) — embutida no grafo exportado
+**Entrada por frame:** 2 mãos × 21 landmarks × 3 coords + 2 flags de presença = **128 features**
+**Janela temporal:** 2,0s → 30 passos a 15fps (reamostrado por timestamp, não por índice)
+**Normalização:** por mão, origem no pulso (landmark 0), escala pela dist. pulso→MCP (landmark 9),
+piso de escala `0.02` e resultado limitado a `±5.0` — embutida no grafo exportado, com paridade
+numérica exata confirmada entre a versão Python e a versão TF do grafo. Os dois valores acima
+(piso e limite) não são cosméticos: sem eles, a quantização INT8 podia travar em runtime ou perder
+acurácia — ver [`models/artifacts/MODEL_CARD.md`](models/artifacts/MODEL_CARD.md) para os números.
 
-**Fallbacks documentados:**
-- Opção B: GRU(48, seq=True) → GRU(32) → Dense(7) — se A overfitar
-- Opção C: Conv1D×3 → GlobalAvgPool → Dense(32) → Dense(7) — se GRU não converter em builtin-only TFLite
+**Fallbacks documentados, nunca usados:**
+- Opção B: GRU(48, seq=True) → GRU(32) → Dense(7) — só se A tivesse overfitado (não overfitou)
+- Opção C: Conv1D×3 → GlobalAvgPool → Dense(32) → Dense(7) — só se GRU não convertesse (converteu)
 
-**Alvo de acurácia:** piso obrigatório > 75,1% (Lulla et al. 2021) · referência 93,5% (GhostHandEgoNet, IJPRAI 2026)
+**Resultado real (teste, sujeitos nunca vistos em treino):**
+
+| | Keras FP32 | TFLite INT8 |
+|---|---|---|
+| Acurácia geral (por janela) | 97,19% | 96,10% |
+| Acurácia por vídeo (voto majoritário, 60 vídeos) | 100% | não medido separadamente |
+
+Piso obrigatório (> 75,1%, Lulla et al. 2021) e referência esticada (93,5%, GhostHandEgoNet,
+IJPRAI 2026) **superados nas duas versões**. Classes mais fracas: `step1_palma_palma` e
+`step3_palma_entrelacada` (confundidas entre si) — não `step4`/`step7` como o plano original
+apostava; ver o model card para a matriz de confusão completa.
 
 ---
 
 ## Handoff para o time Android (`models/artifacts/`)
 
-Arquivos que serão entregues ao fim do Dia 2:
+Entregue ao fim do Dia 2:
 
 | Arquivo | Descrição |
 |---|---|
-| `handwash_step_classifier.tflite` | modelo quantizado INT8 (float32 I/O) |
+| `handwash_step_classifier.tflite` | modelo quantizado INT8 (float32 I/O), 522KB |
 | `classes.json` | lista ordenada das 7 classes (índice = softmax) — congelada |
 | `MODEL_CARD.md` | shapes/dtypes, windowing 2s/15fps, norm. embutida, acurácia por classe, limitações |
-| `parity_check.py` | script p/ o time Android validar o .tflite independentemente |
-| `sample_io_pairs.npz` | 2–3 janelas reais de teste com saída esperada |
+| `parity_check.py` | script p/ o time Android validar o .tflite independentemente — testado, passa |
+| `sample_io_pairs.npz` | 3 janelas reais de teste (classes diferentes) com saída esperada |
+
+Falta: o time Android rodar `parity_check.py` do lado deles e confirmar. Domain gap
+(câmera de pia → óculos egocêntricos) ainda não testado — ver Status acima.
 
 ---
 
