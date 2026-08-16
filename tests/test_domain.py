@@ -3,7 +3,16 @@ import numpy as np
 import pytest
 
 from handwash.config.constants import CLASSES
+from handwash.domain.augmentation import (
+    augment_window,
+    jitter_time,
+    landmark_noise,
+    mirror_lr,
+    rotate_z,
+    scale_jitter,
+)
 from handwash.domain.class_scheme import class_to_index, raw_folder_to_class
+from handwash.domain.class_weights import compute_class_weights
 from handwash.domain.filename_parsing import parse_video_filename
 from handwash.domain.gap_filling import (
     MAX_SHORT_GAP_FRAMES,
@@ -12,8 +21,15 @@ from handwash.domain.gap_filling import (
     detection_rate,
     interpolate_short_gaps,
 )
+from handwash.domain.normalization import normalize_and_mask, normalize_hand, zero_out_absent_hands
+from handwash.domain.resampling import resample_linear, resample_nearest, target_grid
 from handwash.domain.sampling import rotated_subject_sample, sample_subjects_for_folder
-from handwash.domain.splits import split_for_subject, validate_split_integrity
+from handwash.domain.splits import (
+    assert_no_cross_split_subjects,
+    split_for_subject,
+    validate_split_integrity,
+)
+from handwash.domain.windowing import slice_windows, window_start_indices
 
 
 def test_parse_filename_with_underscore():
@@ -190,3 +206,329 @@ def test_sample_subjects_respects_n_per_folder():
     for n in (1, 3, 4, 6):
         chosen = sample_subjects_for_folder(0, non_g05, g05, n)
         assert len(chosen) == n
+
+
+# --- resampling (Dia 2, Secao 4 do plano: 30fps nativo -> 15fps por timestamp) ---
+
+def test_target_grid_spacing_and_count():
+    grid = target_grid(duration_sec=0.3, target_fps=10.0)
+    assert np.allclose(grid, [0.0, 0.1, 0.2, 0.3], atol=1e-6)
+
+
+def test_resample_linear_interpolates_exactly_on_a_linear_ramp():
+    timestamps = np.array([0.0, 0.1, 0.2, 0.3], dtype=np.float32)
+    values = np.array([[0.0], [10.0], [20.0], [30.0]], dtype=np.float32)
+    target_ts = np.array([0.05, 0.15, 0.25], dtype=np.float32)
+
+    resampled = resample_linear(values, timestamps, target_ts)
+
+    assert np.allclose(resampled, [[5.0], [15.0], [25.0]], atol=1e-4)
+
+
+def test_resample_linear_clamps_outside_native_range_no_extrapolation():
+    timestamps = np.array([0.0, 0.1, 0.2], dtype=np.float32)
+    values = np.array([[0.0], [10.0], [20.0]], dtype=np.float32)
+    target_ts = np.array([-1.0, 5.0], dtype=np.float32)  # bem fora do intervalo nativo
+
+    resampled = resample_linear(values, timestamps, target_ts)
+
+    assert np.allclose(resampled, [[0.0], [20.0]])  # satura nas pontas, nao extrapola
+
+
+def test_resample_nearest_picks_closer_native_frame_not_a_blend():
+    timestamps = np.array([0.0, 0.1, 0.2, 0.3], dtype=np.float32)
+    presence = np.array([[1], [0], [1], [0]], dtype=np.uint8)
+    target_ts = np.array([0.03, 0.08, 0.24], dtype=np.float32)
+
+    resampled = resample_nearest(presence, timestamps, target_ts)
+
+    # 0.03 -> mais perto de 0.0 (presence=1); 0.08 -> mais perto de 0.1 (presence=0);
+    # 0.24 -> mais perto de 0.2 (presence=1). Nunca um valor fracionario.
+    assert resampled.flatten().tolist() == [1, 0, 1]
+
+
+# --- windowing (Dia 2, Secao 4 do plano: janelas de 30 passos, sem padding) ---
+
+def test_window_start_indices_basic_stride():
+    assert window_start_indices(n_frames=10, window_steps=3, stride_steps=2) == [0, 2, 4, 6]
+
+
+def test_window_start_indices_drops_incomplete_tail_no_padding():
+    # n_frames=5, window=3, stride=1 caberia janelas em 0,1,2 - nao ha janela em 3
+    # (cobriria 3,4,5 mas so existem indices ate 4) nem em 4.
+    assert window_start_indices(n_frames=5, window_steps=3, stride_steps=1) == [0, 1, 2]
+
+
+def test_window_start_indices_shorter_than_window_returns_empty():
+    assert window_start_indices(n_frames=2, window_steps=3, stride_steps=1) == []
+
+
+def test_slice_windows_preserves_temporal_order_and_shape():
+    features = np.arange(20, dtype=np.float32).reshape(10, 2)
+    starts = [0, 2, 4]
+
+    windows = slice_windows(features, starts, window_steps=3)
+
+    assert windows.shape == (3, 3, 2)
+    assert np.array_equal(windows[0], features[0:3])
+    assert np.array_equal(windows[1], features[2:5])
+    assert np.array_equal(windows[2], features[4:7])
+
+
+def test_slice_windows_empty_starts_returns_correctly_shaped_empty_array():
+    features = np.zeros((10, 2), dtype=np.float32)
+    windows = slice_windows(features, [], window_steps=3)
+    assert windows.shape == (0, 3, 2)
+
+
+# --- normalization (Dia 2, Secao 5 do plano: origem no pulso, escala pulso->MCP-medio) ---
+
+def test_normalize_hand_wrist_maps_to_origin_and_mcp_distance_becomes_one():
+    landmarks = np.zeros((21, 3), dtype=np.float32)
+    landmarks[0] = [1.0, 1.0, 1.0]  # pulso
+    landmarks[9] = [1.0, 1.0, 3.0]  # MCP do dedo medio - distancia 2.0 do pulso
+    landmarks[5] = [3.0, 1.0, 1.0]  # ponto arbitrario
+
+    normalized = normalize_hand(landmarks)
+
+    assert np.allclose(normalized[0], [0.0, 0.0, 0.0], atol=1e-6)
+    assert np.isclose(np.linalg.norm(normalized[9]), 1.0, atol=1e-6)
+    assert np.allclose(normalized[5], [1.0, 0.0, 0.0], atol=1e-6)
+
+
+def test_normalize_hand_zero_filled_frame_stays_zero_no_nan_or_inf():
+    landmarks = np.zeros((21, 3), dtype=np.float32)  # simula presence=0
+    normalized = normalize_hand(landmarks)
+    assert np.all(np.isfinite(normalized))
+    assert np.allclose(normalized, 0.0)
+
+
+def test_normalize_hand_clips_extreme_scale_outliers():
+    # Regressao do achado real ao investigar a queda de acuracia na quantizacao INT8: uma
+    # mao mal rastreada mas nao ausente (presence=1) pode ter distancia pulso->MCP minuscula
+    # sem bater o piso _MIN_SCALE, fazendo a divisao explodir. Sem clip, isso destroi a
+    # calibracao MinMax do TFLite mesmo sendo raro (~0.0004% dos valores reais).
+    landmarks = np.zeros((21, 3), dtype=np.float32)
+    landmarks[0] = [0.0, 0.0, 0.0]  # pulso
+    landmarks[9] = [0.001, 0.0, 0.0]  # MCP quase colado no pulso - escala minuscula, nao zero
+    landmarks[5] = [1.0, 0.0, 0.0]  # ponto normal, mas a distancia do pulso vira gigante apos dividir
+
+    normalized = normalize_hand(landmarks)
+
+    assert np.all(np.abs(normalized) <= 5.0 + 1e-6)
+    assert np.all(np.isfinite(normalized))
+
+
+def test_normalize_hand_broadcasts_independently_over_leading_batch_dims():
+    landmarks = np.zeros((2, 2, 21, 3), dtype=np.float32)  # (frames, slots, 21, 3)
+    landmarks[0, 0, 0] = [0.0, 0.0, 0.0]
+    landmarks[0, 0, 9] = [0.0, 0.0, 1.0]  # escala 1.0 nesta mao
+    landmarks[1, 1, 0] = [5.0, 5.0, 5.0]
+    landmarks[1, 1, 9] = [5.0, 5.0, 9.0]  # escala 4.0 nesta outra mao/frame
+
+    normalized = normalize_hand(landmarks)
+
+    assert np.isclose(np.linalg.norm(normalized[0, 0, 9]), 1.0, atol=1e-6)
+    assert np.isclose(np.linalg.norm(normalized[1, 1, 9]), 1.0, atol=1e-6)
+
+
+def test_zero_out_absent_hands_clears_only_frames_marked_absent():
+    normalized = np.ones((3, 2, 21, 3), dtype=np.float32)
+    presence = np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint8)
+
+    result = zero_out_absent_hands(normalized, presence)
+
+    assert np.allclose(result[0, 1], 0.0)  # ausente
+    assert np.allclose(result[1, 0], 0.0)  # ausente
+    assert np.allclose(result[0, 0], 1.0)  # presente, inalterado
+    assert np.allclose(result[2, 0], 1.0)
+    assert np.allclose(result[2, 1], 1.0)
+    assert np.allclose(normalized, 1.0)  # nao muta a entrada original
+
+
+def test_composed_pipeline_gap_boundary_leak_is_closed_by_normalize_and_mask():
+    # Regressao do achado de revisao de codigo: um frame reamostrado bem na fronteira
+    # entre deteccao real (frame 0) e um gap longo zero-preenchido (frame 1) interpola
+    # uma pose ENCOLHIDA em direcao a zero. Sem mascarar por presence, normalize_hand()
+    # (invariante a escala) reconstroi a pose real mesmo com presence=0 - o teste abaixo
+    # prova numericamente as duas metades: (1) o vazamento existe se so normalize_hand()
+    # for chamada, (2) normalize_and_mask() fecha ele de fato.
+    native_ts = np.array([0.0, 0.1], dtype=np.float32)
+    landmarks = np.zeros((2, 1, 21, 3), dtype=np.float32)
+    landmarks[0, 0, 0] = [1.0, 1.0, 1.0]  # pulso, frame 0 (real)
+    landmarks[0, 0, 9] = [1.0, 1.0, 3.0]  # MCP, frame 0 (real) - escala 2.0
+    landmarks[0, 0, 5] = [3.0, 1.0, 1.0]  # ponto arbitrario, frame 0 (real)
+    # frame 1 fica zero (inicio de um gap longo zero-preenchido), presence=0
+    presence = np.array([[1], [0]], dtype=np.uint8)
+
+    target_ts = np.array([0.07], dtype=np.float32)  # alpha=0.7 - puxa pro lado zero-preenchido
+
+    resampled_landmarks = resample_linear(landmarks, native_ts, target_ts)
+    resampled_presence = resample_nearest(presence, native_ts, target_ts)
+    assert resampled_presence[0, 0] == 0  # nearest escolhe o frame ausente (alpha=0.7 >= 0.5)
+
+    unmasked = normalize_hand(resampled_landmarks)
+    assert np.allclose(unmasked[0, 0, 5], [1.0, 0.0, 0.0], atol=1e-5)  # o vazamento: pose real "vaza"
+
+    fixed = normalize_and_mask(resampled_landmarks, resampled_presence)
+    assert np.allclose(fixed[0, 0], 0.0)  # normalize_and_mask fecha o vazamento de fato
+
+
+# --- split leakage assertion contra dados montados (Dia 2, Secao 3 do plano) ---
+
+def test_assert_no_cross_split_subjects_passes_when_consistent():
+    rows = [
+        {"subject_id": 1, "split": "train"},  # 1 esta em SUBJECT_SPLITS["train"]
+        {"subject_id": 1, "split": "train"},
+        {"subject_id": 4, "split": "val"},  # 4 esta em SUBJECT_SPLITS["val"]
+    ]
+    assert_no_cross_split_subjects(rows)  # nao deve levantar excecao
+
+
+def test_assert_no_cross_split_subjects_raises_on_leakage():
+    rows = [
+        {"subject_id": 1, "split": "train"},
+        {"subject_id": 1, "split": "test"},
+    ]
+    with pytest.raises(ValueError):
+        assert_no_cross_split_subjects(rows)
+
+
+def test_assert_no_cross_split_subjects_catches_staleness_vs_subject_splits():
+    # Regressao do achado de revisao de codigo: a versao antiga so checava consistencia
+    # ENTRE as linhas dadas, nunca contra o SUBJECT_SPLITS atual - um manifesto gerado
+    # sob um split antigo, mas internamente autoconsistente, passava batido. Aqui so ha
+    # UMA linha (autoconsistente por definicao) com um split que nao bate com o real.
+    rows = [{"subject_id": 1, "split": "val"}]  # 1 e train de verdade (SUBJECT_SPLITS)
+    with pytest.raises(ValueError):
+        assert_no_cross_split_subjects(rows)
+
+
+# --- augmentacao (Dia 2, Secao 5 do plano - so treino, nunca val/teste) ---
+
+def _make_window(landmarks, presence):
+    """landmarks: (T,2,21,3), presence: (T,2). Monta uma janela (T,128) igual ao
+    contrato do gold layer, sem depender de helpers privados do modulo testado."""
+    flat = landmarks.reshape(landmarks.shape[0], -1)
+    return np.concatenate([flat, presence.astype(np.float32)], axis=-1).astype(np.float32)
+
+
+def test_mirror_lr_swaps_slots_and_flips_x():
+    landmarks = np.zeros((2, 2, 21, 3), dtype=np.float32)
+    landmarks[:, 0, 5] = [1.0, 2.0, 3.0]  # slot esquerdo, ponto 5
+    landmarks[:, 1, 5] = [4.0, 5.0, 6.0]  # slot direito, ponto 5
+    presence = np.array([[1, 0], [0, 1]], dtype=np.float32)
+    window = _make_window(landmarks, presence)
+
+    mirrored = mirror_lr(window)
+    m_landmarks = mirrored[:, :126].reshape(2, 2, 21, 3)
+    m_presence = mirrored[:, 126:]
+
+    assert np.allclose(m_landmarks[:, 0, 5], [-4.0, 5.0, 6.0])  # direito virou esquerdo, x invertido
+    assert np.allclose(m_landmarks[:, 1, 5], [-1.0, 2.0, 3.0])  # esquerdo virou direito, x invertido
+    assert np.array_equal(m_presence, presence[:, ::-1])
+
+
+def test_mirror_lr_preserves_zero_for_absent_hand():
+    landmarks = np.zeros((3, 2, 21, 3), dtype=np.float32)
+    presence = np.zeros((3, 2), dtype=np.float32)
+    window = _make_window(landmarks, presence)
+    assert np.allclose(mirror_lr(window), 0.0)
+
+
+def test_rotate_z_preserves_xy_norm_and_absent_hand_zero():
+    rng = np.random.default_rng(0)
+    landmarks = np.zeros((1, 2, 21, 3), dtype=np.float32)
+    landmarks[0, 0, 5] = [3.0, 4.0, 1.0]  # norma no plano xy = 5.0
+    presence = np.array([[1, 0]], dtype=np.float32)  # slot 1 ausente
+    window = _make_window(landmarks, presence)
+
+    rotated = rotate_z(window, max_degrees=15.0, rng=rng)
+    r_landmarks = rotated[:, :126].reshape(1, 2, 21, 3)
+
+    assert np.isclose(np.linalg.norm(r_landmarks[0, 0, 5, :2]), 5.0, atol=1e-5)  # rotacao preserva norma
+    assert np.isclose(r_landmarks[0, 0, 5, 2], 1.0)  # z inalterado
+    assert np.allclose(r_landmarks[0, 1], 0.0)  # slot ausente continua zero
+
+
+def test_scale_jitter_scales_and_preserves_absent_hand_zero():
+    rng = np.random.default_rng(0)
+    landmarks = np.zeros((1, 2, 21, 3), dtype=np.float32)
+    landmarks[0, 0, 5] = [2.0, 0.0, 0.0]
+    presence = np.array([[1, 0]], dtype=np.float32)
+    window = _make_window(landmarks, presence)
+
+    scaled = scale_jitter(window, scale_range=(2.0, 2.0), rng=rng)  # fator fixo = 2.0
+    s_landmarks = scaled[:, :126].reshape(1, 2, 21, 3)
+
+    assert np.allclose(s_landmarks[0, 0, 5], [4.0, 0.0, 0.0])
+    assert np.allclose(s_landmarks[0, 1], 0.0)
+
+
+def test_landmark_noise_perturbs_present_but_zeroes_absent():
+    rng = np.random.default_rng(0)
+    landmarks = np.zeros((1, 2, 21, 3), dtype=np.float32)
+    landmarks[0, 0, 5] = [1.0, 1.0, 1.0]
+    presence = np.array([[1, 0]], dtype=np.float32)
+    window = _make_window(landmarks, presence)
+
+    noisy = landmark_noise(window, sigma=0.1, rng=rng)
+    n_landmarks = noisy[:, :126].reshape(1, 2, 21, 3)
+
+    assert not np.allclose(n_landmarks[0, 0, 5], [1.0, 1.0, 1.0])  # ruido de fato mudou o presente
+    assert np.allclose(n_landmarks[0, 1], 0.0)  # ausente continua exatamente zero, sem ruido
+
+
+def test_jitter_time_preserves_shape_and_boundary_absence_stays_zero():
+    rng = np.random.default_rng(0)
+    landmarks = np.zeros((4, 2, 21, 3), dtype=np.float32)
+    landmarks[0:2, 0, 5] = [1.0, 1.0, 1.0]  # frames 0-1, slot 0: mao real presente
+    presence = np.zeros((4, 2), dtype=np.float32)
+    presence[0:2, 0] = 1.0  # slot 1 sempre ausente; slot 0 vira ausente nos frames 2-3
+    window = _make_window(landmarks, presence)
+
+    shifted = jitter_time(window, max_shift_steps=0.5, rng=rng)
+    assert shifted.shape == window.shape
+    assert np.all(np.isfinite(shifted))
+
+    s_landmarks = shifted[:, :126].reshape(4, 2, 21, 3)
+    s_presence = shifted[:, 126:]
+    assert np.allclose(s_landmarks[s_presence == 0], 0.0)  # nunca vaza pose onde presence=0
+
+
+def test_augment_window_preserves_shape_and_finiteness():
+    rng = np.random.default_rng(0)
+    landmarks = np.random.default_rng(1).normal(size=(30, 2, 21, 3)).astype(np.float32)
+    presence = np.ones((30, 2), dtype=np.float32)
+    window = _make_window(landmarks, presence)
+
+    for _ in range(10):  # varias chamadas, cobre combinacoes diferentes de augmentations
+        augmented = augment_window(window, rng)
+        assert augmented.shape == window.shape
+        assert np.all(np.isfinite(augmented))
+
+
+# --- pesos de classe (Dia 2, Secao 6 do plano) ---
+
+def test_compute_class_weights_balanced_case_gives_equal_weights():
+    class_names = [CLASSES[0]] * 10 + [CLASSES[1]] * 10
+    weights = compute_class_weights(class_names)
+    assert np.isclose(weights[0], weights[1])
+
+
+def test_compute_class_weights_matches_known_25_vs_50_ratio():
+    # replica o desbalanceamento real do dataset (Secao 1/Labels do CLAUDE.md): 2 classes
+    # com 25 videos, 5 classes com 50.
+    class_names = [CLASSES[0]] * 25 + [CLASSES[2]] * 25
+    for name in (CLASSES[1], CLASSES[3], CLASSES[4], CLASSES[5], CLASSES[6]):
+        class_names += [name] * 50
+    weights = compute_class_weights(class_names)
+
+    assert np.isclose(weights[0] / weights[1], 2.0, atol=1e-6)  # classe de 25 pesa 2x mais
+    assert np.isclose(weights[0], 300 / (7 * 25))
+
+
+def test_compute_class_weights_omits_absent_class():
+    class_names = [CLASSES[0]] * 5  # so uma classe presente
+    weights = compute_class_weights(class_names)
+    assert set(weights.keys()) == {0}

@@ -14,6 +14,13 @@ WINDOW_STEPS = int(WINDOW_SEC * TARGET_FPS)  # 30
 TRAIN_STRIDE_SEC = 0.5
 VAL_TEST_STRIDE_SEC = 1.0
 
+# --- Normalizacao por mao e contrato de features (Secao 5 do plano) ---
+# Indices fixos pela topologia de 21 pontos do MediaPipe Hand Landmarker.
+WRIST_LANDMARK_IDX = 0
+MIDDLE_MCP_LANDMARK_IDX = 9
+NUM_LANDMARK_COORDS = 2 * 21 * 3  # 2 maos x 21 pontos x (x,y,z) = 126
+WINDOW_FEATURE_DIM = NUM_LANDMARK_COORDS + 2  # + 2 presence flags = 128, contrato fixo
+
 # --- Esquema de classes: 7 classes finais, Left/Right mesclado, pulso como classe propria ---
 RAW_FOLDER_TO_CLASS = {
     "Step_1": "step1_palma_palma",
