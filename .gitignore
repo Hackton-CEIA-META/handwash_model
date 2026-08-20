@@ -20,6 +20,10 @@ data/silver/landmarks/
 data/gold/**/*.npz
 data/gold/**/*.npy
 
+# Custom (Dia 3, teste de domain gap): mesma logica do silver - landmarks
+# derivados nao sao versionados, so o manifest.csv (pequeno) fica.
+data/custom/landmarks/
+
 # Modelos - checkpoints de treino sao intermediarios, nao versionados.
 # O artefato final (.tflite + classes.json + MODEL_CARD.md) em models/artifacts/ FICA versionado.
 models/checkpoints/

@@ -45,7 +45,9 @@ def _read_bronze_manifest() -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def build_video_features(video_stem: str, normalize: bool = True) -> tuple[np.ndarray, np.ndarray]:
+def build_video_features(
+    video_stem: str, normalize: bool = True, landmarks_dir=SILVER_LANDMARKS_DIR
+) -> tuple[np.ndarray, np.ndarray]:
     """Retorna (features, target_timestamps). features: float32[n_resampled, 128].
 
     normalize=False retorna landmarks BRUTOS (so reamostrados, sem normalize_and_mask) -
@@ -53,8 +55,13 @@ def build_video_features(video_stem: str, normalize: bool = True) -> tuple[np.nd
     exportado embute a normalizacao internamente (CLAUDE.md: "nao reimplementada em
     Kotlin"), entao o dataset representativo de calibracao INT8 precisa ver a MESMA
     distribuicao bruta que o grafo vai receber em producao, nao o dado ja normalizado
-    que build_windows() usa pra treino."""
-    npz_path = SILVER_LANDMARKS_DIR / f"{video_stem}.npz"
+    que build_windows() usa pra treino.
+
+    landmarks_dir=SILVER_LANDMARKS_DIR por padrao (os 300 videos do Kaggle) - o teste de
+    domain gap (Dia 3, application.evaluate_domain_gap) passa CUSTOM_LANDMARKS_DIR pra
+    reusar exatamente esta mesma funcao (resample + normalize_and_mask) sobre video
+    proprio, sem duplicar a logica."""
+    npz_path = landmarks_dir / f"{video_stem}.npz"
     with np.load(npz_path) as data:
         world_landmarks = data["world_landmarks"]
         presence = data["presence"]

@@ -10,6 +10,9 @@ RAW_DATASET_DIR = Path(r"D:\Hackton Meta\HandWashDataset")
 BRONZE_DIR = REPO_ROOT / "data" / "bronze"
 BRONZE_MANIFEST = BRONZE_DIR / "manifest.csv"
 BRONZE_PROBE_REPORT = BRONZE_DIR / "probe_report.csv"
+# Merge Kaggle (300 videos) + video proprio (Dia 4) - ver application.merge_custom_dataset.
+# BRONZE_MANIFEST em si (Kaggle puro, 300 linhas) fica intocado, reproduz o Dia 1 sempre.
+BRONZE_MANIFEST_MERGED = BRONZE_DIR / "manifest_merged.csv"
 
 # Silver: landmarks extraidos por video, limpos/estruturados
 SILVER_DIR = REPO_ROOT / "data" / "silver"
@@ -19,6 +22,14 @@ SILVER_MANIFEST = SILVER_DIR / "manifest.csv"
 # Gold: janelas normalizadas, prontas pra treino (Dia 2)
 GOLD_DIR = REPO_ROOT / "data" / "gold"
 GOLD_CLASSES_JSON = GOLD_DIR / "classes.json"
+
+# Custom: video(s) proprios (camera de celular) pro teste de domain gap (Dia 3).
+# Mesma convencao do dataset Kaggle - video bruto fica FORA do repo, so
+# manifest.csv (pequeno, versionado) e landmarks derivados (gitignored) ficam aqui.
+CUSTOM_RAW_DIR = Path(r"D:\Hackton Meta\HandWashCustom")
+CUSTOM_DIR = REPO_ROOT / "data" / "custom"
+CUSTOM_MANIFEST = CUSTOM_DIR / "manifest.csv"
+CUSTOM_LANDMARKS_DIR = CUSTOM_DIR / "landmarks"
 
 # Modelos
 MODELS_DIR = REPO_ROOT / "models"
